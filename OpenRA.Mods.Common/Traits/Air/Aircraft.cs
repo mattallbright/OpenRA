@@ -17,6 +17,7 @@ using OpenRA.Activities;
 using OpenRA.Mods.Common.Activities;
 using OpenRA.Mods.Common.Orders;
 using OpenRA.Primitives;
+using OpenRA.Support;
 using OpenRA.Traits;
 
 namespace OpenRA.Mods.Common.Traits
@@ -39,7 +40,7 @@ namespace OpenRA.Mods.Common.Traits
 		public readonly int TurnSpeed = 255;
 		public readonly int Speed = 1;
 
-		[Desc("Minimum altitude where this aircraft is considered airborne")]
+		[Desc("Minimum altitude where this aircraft is considered airborne.")]
 		public readonly int MinAirborneAltitude = 1;
 		public readonly HashSet<string> LandableTerrainTypes = new HashSet<string>();
 
@@ -100,6 +101,10 @@ namespace OpenRA.Mods.Common.Traits
 			yield return new FacingInit(PreviewFacing);
 		}
 
+		[Desc("Condition when this aircraft should land as soon as possible and refuse to take off. ",
+			"This only applies while the aircraft is above terrain which is listed in LandableTerrainTypes.")]
+		public readonly BooleanExpression LandOnCondition;
+
 		public IReadOnlyDictionary<CPos, SubCell> OccupiedCells(ActorInfo info, CPos location, SubCell subCell = SubCell.Any) { return new ReadOnlyDictionary<CPos, SubCell>(); }
 		bool IOccupySpaceInfo.SharesCell { get { return false; } }
 
@@ -124,7 +129,7 @@ namespace OpenRA.Mods.Common.Traits
 	}
 
 	public class Aircraft : ITick, ISync, IFacing, IPositionable, IMove, IIssueOrder, IResolveOrder, IOrderVoice, IDeathActorInitModifier,
-		INotifyCreated, INotifyAddedToWorld, INotifyRemovedFromWorld, INotifyActorDisposing, IActorPreviewInitModifier, IIssueDeployOrder
+		INotifyCreated, INotifyAddedToWorld, INotifyRemovedFromWorld, INotifyActorDisposing, IActorPreviewInitModifier, IIssueDeployOrder, IObservesVariables
 	{
 		static readonly Pair<CPos, SubCell>[] NoCells = { };
 
@@ -142,6 +147,7 @@ namespace OpenRA.Mods.Common.Traits
 		public int TurnSpeed { get { return Info.TurnSpeed; } }
 		public Actor ReservedActor { get; private set; }
 		public bool MayYieldReservation { get; private set; }
+		public bool ForceLanding { get; private set; }
 
 		bool airborne;
 		bool cruising;
@@ -152,6 +158,7 @@ namespace OpenRA.Mods.Common.Traits
 		bool isMoving;
 		bool isMovingVertically;
 		WPos cachedPosition;
+		bool? landNow;
 
 		public Aircraft(ActorInitializer init, AircraftInfo info)
 		{
@@ -169,6 +176,17 @@ namespace OpenRA.Mods.Common.Traits
 			// TODO: HACK: This is a hack until we can properly distinguish between airplane and helicopter!
 			// Or until the activities get unified enough so that it doesn't matter.
 			IsPlane = !info.CanHover;
+		}
+
+		public virtual IEnumerable<VariableObserver> GetVariableObservers()
+		{
+			if (Info.LandOnCondition != null)
+				yield return new VariableObserver(ForceLandConditionChanged, Info.LandOnCondition.Variables);
+		}
+
+		void ForceLandConditionChanged(Actor self, IReadOnlyDictionary<string, int> variables)
+		{
+			landNow = Info.LandOnCondition.Evaluate(variables);
 		}
 
 		public void Created(Actor self)
@@ -206,6 +224,33 @@ namespace OpenRA.Mods.Common.Traits
 					return;
 
 				self.QueueActivity(new TakeOff(self));
+			}
+
+			// Add land activity if LandOnCondidion resolves to true and the actor can land at the current location.
+			if (landNow.HasValue && landNow.Value && airborne && CanLand(self.Location)
+				&& !(self.CurrentActivity is HeliLand || self.CurrentActivity is Turn))
+			{
+				self.CancelActivity();
+
+				if (Info.TurnToLand)
+					self.QueueActivity(new Turn(self, Info.InitialFacing));
+
+				self.QueueActivity(new HeliLand(self, true));
+
+				ForceLanding = true;
+			}
+
+			// Add takeoff activity if LandOnCondidion resolves to false and the actor should not land when idle.
+			if (landNow.HasValue && !landNow.Value && !cruising && !(self.CurrentActivity is TakeOff))
+			{
+				ForceLanding = false;
+
+				if (!Info.LandWhenIdle)
+				{
+					self.CancelActivity();
+
+					self.QueueActivity(new TakeOff(self));
+				}
 			}
 
 			var oldCachedPosition = cachedPosition;
